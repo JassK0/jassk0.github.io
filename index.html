@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>RSVP Form</title>
+</head>
+<body>
+  <h1>RSVP Form</h1>
+  <form id="rsvpForm">
+    <label for="name">Name:</label>
+    <input type="text" id="name" name="name" required>
+
+    <label for="email">Email:</label>
+    <input type="email" id="email" name="email" required>
+
+    <button type="submit">Submit</button>
+  </form>
+
+  <script type="text/javascript"
+        src="https://cdn.jsdelivr.net/npm/emailjs-com/dist/email.min.js"></script>
+  <script type="text/javascript">
+    (function () {
+      emailjs.init('ohHxxiItBjaIopsoW'); // Replace with your EmailJS public key
+
+      document.getElementById('rsvpForm').addEventListener('submit', function (event) {
+        event.preventDefault();
+
+        const name = document.getElementById('name').value;
+        const email = document.getElementById('email').value;
+
+        const params = {
+          to_email: email,
+          from_name: name,
+          message: `Dear ${name},\n\nThank you for your RSVP. We look forward to seeing you at the event!`,
+        };
+
+        emailjs.send('service_bab6j8s', 'template_z56z6su', params)
+          .then(function (response) {
+            alert('Email sent successfully!', response);
+            document.getElementById('rsvpForm').reset();
+          })
+          .catch(function (error) {
+            alert('Email sending failed, this is an error on our end, nothing you need to do:', error);
+          });
+      });
+    })();
+  </script>
+</body>
+</html>
