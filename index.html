@@ -15,11 +15,16 @@
     <button type="submit">Submit</button>
   </form>
 
+  <p>Total Emails: <span id="counter">0</span></p>
+  
   <script type="text/javascript"
         src="https://cdn.jsdelivr.net/npm/emailjs-com/dist/email.min.js"></script>
   <script type="text/javascript">
     (function () {
       emailjs.init('ohHxxiItBjaIopsoW'); // Replace with your EmailJS public key
+
+      var emailCounter = localStorage.getItem('emailCounter') || 0;
+      document.getElementById('counter').textContent = emailCounter;
 
       document.getElementById('rsvpForm').addEventListener('submit', function (event) {
         event.preventDefault();
@@ -37,12 +42,22 @@
           .then(function (response) {
             alert('Email sent successfully!', response);
             document.getElementById('rsvpForm').reset();
+            updateCounter(); // Update the counter
           })
           .catch(function (error) {
             alert('Email sending failed, this is an error on our end, nothing you need to do:', error);
           });
       });
+
+      function updateCounter() {
+        emailCounter++;
+        document.getElementById('counter').textContent = emailCounter;
+        localStorage.setItem('emailCounter', emailCounter);
+      }
+    
     })();
   </script>
 </body>
 </html>
+
+
