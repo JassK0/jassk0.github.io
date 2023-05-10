@@ -10,6 +10,7 @@
   }
   
   .box {
+    display: flex;
     width: 700px;
     height: 500px;
     background-color: #2d545e;
