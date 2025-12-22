@@ -44,6 +44,8 @@ def write_pools(pools):
 
 def load_pool_progress(username, pool_id):
     """Return per-pool progress as a dict of CardState objects."""
+    if not pool_id:
+        return {}
     if pool_id == 'builtin':
         if username:
             prog_dict = db.get_progress(username, 'builtin')
@@ -53,8 +55,38 @@ def load_pool_progress(username, pool_id):
     if username:
         prog_dict = db.get_progress(username, pool_id)
         return {k: CardState(**v) for k, v in prog_dict.items()}
+
+    # guest progress stored in per-pool json file
+    ensure_data_dir()
+    prog_fp = f"{DATA_DIR}/progress_{pool_id}.json"
+    if os.path.exists(prog_fp):
+        try:
+            import json as _json
+            raw = _json.load(open(prog_fp, 'r', encoding='utf-8'))
+            return {k: CardState(**v) for k, v in raw.items()}
+        except Exception:
+            return {}
     return {}
 
+def _default_gamestate():
+    return {
+        'points': 0,
+        'rank': 'Unranked',
+        'answer_streak': 0,
+        'daily_streak': 0,
+        'last_active': None,
+        'history': [],
+    }
+
+def get_guest_gamestate():
+    gs = session.get('guest_gs')
+    if not gs:
+        gs = _default_gamestate()
+        session['guest_gs'] = gs
+    return gs
+
+def save_guest_gamestate(gs):
+    session['guest_gs'] = gs
 
 def save_pool_progress(username, pool_id, prog):
     """Persist per-pool progress."""
@@ -67,6 +99,17 @@ def save_pool_progress(username, pool_id, prog):
 
     if username:
         db.save_bulk_progress(username, pool_id, {k: v.__dict__ for k, v in prog.items()})
+        return
+
+    # guest progress → per-pool json file
+    ensure_data_dir()
+    prog_fp = f"{DATA_DIR}/progress_{pool_id}.json"
+    try:
+        import json as _json
+        with open(prog_fp, 'w', encoding='utf-8') as f:
+            _json.dump({k: v.__dict__ for k, v in prog.items()}, f, indent=2)
+    except Exception:
+        pass
 
 def compute_stats_for_pool(pool_meta):
     # pool_meta: {id,path,orig_name}
@@ -165,14 +208,7 @@ def load_gamestate(user_id=None):
         check_and_award_badges(gs)
         return gs
     # default gamestate for non-logged-in users
-    return {
-        'points': 0,
-        'rank': 'Unranked',
-        'answer_streak': 0,
-        'daily_streak': 0,
-        'last_active': None,
-        'history': []
-    }
+    return _default_gamestate()
 
 
 def save_gamestate(gs, user_id=None):
@@ -692,34 +728,42 @@ def question():
         # Update session in database
         db.update_session(sid, state)
 
-        # gamification: award points (per-user) after answering
+        # gamification: award points (per-user or guest) after answering
         user = current_user()
         if user:
             gs = load_gamestate(user)
-            # ensure daily streak is current for this activity
-            gs = update_daily_streak(gs)
-
-            # implement streak-based doubling
-            streak = gs.get('answer_streak', 0) or 0
-            if ok:
-                if streak < 0:
-                    streak = 0
-                delta = 10 * (2 ** streak)
-                streak = streak + 1
-                reason = 'correct'
-            else:
-                if streak > 0:
-                    streak = 0
-                # wrong penalty doubles on consecutive wrongs
-                delta = - (2 * (2 ** abs(streak))) if streak < 0 else -2
-                streak = streak - 1
-                reason = 'incorrect'
-            gs['answer_streak'] = streak
-            award_points(gs, delta, reason, user_id=user)
-            return render_template('result.html', ok=ok, q=q, points_delta=delta, points=gs.get('points', 0), rank=gs.get('rank', 'Unranked'), daily_streak=gs.get('daily_streak', 0), current_user=current_user())
         else:
-            # Non-logged in user
-            return render_template('result.html', ok=ok, q=q, points_delta=0, points=0, rank='Unranked', daily_streak=0, current_user=None)
+            gs = get_guest_gamestate()
+
+        # ensure daily streak is current for this activity
+        gs = update_daily_streak(gs)
+
+        streak = gs.get('answer_streak', 0) or 0
+        if ok:
+            if streak < 0:
+                streak = 0
+            delta = 10 * (2 ** streak)
+            streak = streak + 1
+            reason = 'correct'
+        else:
+            if streak > 0:
+                streak = 0
+            delta = - (2 * (2 ** abs(streak))) if streak < 0 else -2
+            streak = streak - 1
+            reason = 'incorrect'
+        gs['answer_streak'] = streak
+
+        if user:
+            award_points(gs, delta, reason, user_id=user)
+        else:
+            # clamp guest points
+            gs['points'] = max(0, gs.get('points', 0) + delta)
+            rec = {'ts': datetime.utcnow().isoformat(timespec='seconds'), 'delta': delta, 'reason': reason}
+            gs.setdefault('history', []).append(rec)
+            check_and_award_badges(gs)
+            save_guest_gamestate(gs)
+
+        return render_template('result.html', ok=ok, q=q, points_delta=delta, points=max(0, gs.get('points', 0)), rank=gs.get('rank', 'Unranked'), daily_streak=gs.get('daily_streak', 0), current_user=user)
 
     # GET: build letter-option pairs for template
     letters = ['A', 'B', 'C', 'D']
