@@ -41,6 +41,33 @@ def write_pools(pools):
     """Deprecated - pools are now managed through database."""
     pass
 
+
+def load_pool_progress(username, pool_id):
+    """Return per-pool progress as a dict of CardState objects."""
+    if pool_id == 'builtin':
+        if username:
+            prog_dict = db.get_progress(username, 'builtin')
+            return {k: CardState(**v) for k, v in prog_dict.items()}
+        return load_progress(PROGRESS_FILE)
+
+    if username:
+        prog_dict = db.get_progress(username, pool_id)
+        return {k: CardState(**v) for k, v in prog_dict.items()}
+    return {}
+
+
+def save_pool_progress(username, pool_id, prog):
+    """Persist per-pool progress."""
+    if pool_id == 'builtin':
+        if username:
+            db.save_bulk_progress(username, 'builtin', {k: v.__dict__ for k, v in prog.items()})
+        else:
+            save_progress(PROGRESS_FILE, prog)
+        return
+
+    if username:
+        db.save_bulk_progress(username, pool_id, {k: v.__dict__ for k, v in prog.items()})
+
 def compute_stats_for_pool(pool_meta):
     # pool_meta: {id,path,orig_name}
     # Support builtin pool (id == 'builtin') which uses the BUILTIN list
@@ -50,12 +77,9 @@ def compute_stats_for_pool(pool_meta):
         qpath = pool_meta['path']
         qs = load_questions(qpath)
     qmap = {q.id: q for q in qs}
-    # Get progress from database
-    username = session.get('username')
-    if username:
-        prog = db.get_progress(username, pool_meta['id'])
-    else:
-        prog = {}
+    # Get progress for current user/session
+    raw_prog = load_pool_progress(session.get('username'), pool_meta.get('id'))
+    prog = {qid: (v.__dict__ if isinstance(v, CardState) else v) for qid, v in raw_prog.items()}
     # compute stats
     total = len(qs)
     answered = len(prog)
@@ -104,39 +128,21 @@ def compute_progress_timeseries(pool_meta):
     username = session.get('username')
     if not username:
         return {'labels': [], 'values': []}
-    
+
     times = {}
-    # Get progress from database
-    if pool_meta.get('id') == 'builtin':
-        # For builtin, use file-based progress for now
-        if os.path.exists(PROGRESS_FILE):
-            try:
-                import json as _json
-                raw = _json.load(open(PROGRESS_FILE, 'r', encoding='utf-8'))
-                for qid, v in raw.items():
-                    last = v.get('last_seen')
-                    if not last:
-                        continue
-                    try:
-                        d = last.split('T', 1)[0]
-                    except Exception:
-                        d = last
-                    times.setdefault(d, 0)
-                    times[d] += 1
-            except Exception:
-                times = {}
-    else:
-        prog_dict = db.get_progress(username, pool_meta['id'])
-        for qid, v in prog_dict.items():
-            last = v.get('last_seen')
-            if not last:
-                continue
-            try:
-                d = last.split('T', 1)[0]
-            except Exception:
-                d = last
-            times.setdefault(d, 0)
-            times[d] += 1
+    prog = load_pool_progress(username, pool_meta.get('id'))
+    for v in prog.values():
+        if isinstance(v, CardState):
+            v = v.__dict__
+        last = v.get('last_seen')
+        if not last:
+            continue
+        try:
+            d = last.split('T', 1)[0]
+        except Exception:
+            d = last
+        times.setdefault(d, 0)
+        times[d] += 1
     
     # create sorted cumulative lists
     if not times:
@@ -203,7 +209,7 @@ def update_daily_streak(gs):
 
 def award_points(gs, amount, reason=None, user_id=None):
     # Record a points change in gamestate
-    gs['points'] = gs.get('points', 0) + amount
+    gs['points'] = max(0, gs.get('points', 0) + amount)
     rec = {'ts': datetime.utcnow().isoformat(timespec='seconds'), 'delta': amount, 'reason': reason}
     gs.setdefault('history', []).append(rec)
     check_and_award_badges(gs)
@@ -402,10 +408,10 @@ def start():
         return "No questions in pool. Go <a href='/'>back</a>."
     sid = uuid.uuid4().hex
     username = current_user()
-    # Store session in database
+    pool_progress = load_pool_progress(username, 'builtin')
     pool_data = [q.__dict__ for q in pool]
-    exam_set = [q.__dict__ for q in choose_exam_set(pool, num, load_progress(PROGRESS_FILE))]
-    progress_data = {k: v.__dict__ for k,v in load_progress(PROGRESS_FILE).items()}
+    exam_set = [q.__dict__ for q in choose_exam_set(pool, num, pool_progress)]
+    progress_data = {k: (v.__dict__ if isinstance(v, CardState) else v) for k, v in pool_progress.items()}
     db.create_session(sid, username, 'builtin', pool_data, exam_set, num, progress_data)
     session['sid'] = sid
     return redirect(url_for('question'))
@@ -557,20 +563,14 @@ def pools_special(pid):
     username = current_user()
     if meta.get('id') == 'builtin':
         qs = load_questions(None)
-        prog = load_progress(PROGRESS_FILE)
     else:
         qs = load_questions(meta['path'])
-        # Get progress from database
-        if username:
-            prog_dict = db.get_progress(username, meta['id'])
-            prog = {k: CardState(**v) for k, v in prog_dict.items()}
-        else:
-            prog = {}
+    prog = load_pool_progress(username, meta.get('id'))
     sid = uuid.uuid4().hex
     # Store session in database
     pool_data = [q.__dict__ for q in qs]
     exam_set = [q.__dict__ for q in choose_special_set(qs, 10, prog)]
-    progress_data = {k: v.__dict__ for k, v in prog.items()}
+    progress_data = {k: (v.__dict__ if isinstance(v, CardState) else v) for k, v in prog.items()}
     db.create_session(sid, username, pid, pool_data, exam_set, 10, progress_data)
     session['sid'] = sid
     session['pool_id'] = pid
@@ -595,21 +595,14 @@ def pools_start(pid):
         else:
             all_qs = load_questions(meta['path'])
             pool = all_qs
-        # load per-pool progress from database
-        prog = {}
-        if meta.get('id') == 'builtin':
-            # fall back to global progress file for builtin
-            prog = load_progress(PROGRESS_FILE)
-        else:
-            if username:
-                prog_dict = db.get_progress(username, meta['id'])
-                prog = {k: CardState(**v) for k, v in prog_dict.items()}
+        # load per-pool progress
+        prog = load_pool_progress(username, meta.get('id'))
 
         sid = uuid.uuid4().hex
         # Store session in database
         pool_data = [q.__dict__ for q in pool]
         exam_set = [q.__dict__ for q in choose_exam_set(pool, num, prog)]
-        progress_data = {k: v.__dict__ for k, v in prog.items()}
+        progress_data = {k: (v.__dict__ if isinstance(v, CardState) else v) for k, v in prog.items()}
         db.create_session(sid, username, pid, pool_data, exam_set, num, progress_data)
         session['sid'] = sid
         session['pool_id'] = pid
@@ -639,31 +632,15 @@ def pools_stats(pid):
     # build extra summary: correct / incorrect counts and accuracy% from database
     extra = {'correct': 0, 'incorrect': 0, 'accuracy': 0}
     if user:
-        if meta.get('id') == 'builtin':
-            # For builtin, use file-based progress
-            if os.path.exists(PROGRESS_FILE):
-                try:
-                    import json as _json
-                    raw = _json.load(open(PROGRESS_FILE, 'r', encoding='utf-8'))
-                    correct = sum(int(v.get('correct_streak', 0)) for v in raw.values())
-                    incorrect = sum(int(v.get('incorrect_count', 0)) for v in raw.values())
-                    denom = correct + incorrect
-                    acc = int((correct * 100) / denom) if denom else 0
-                    extra = {'correct': correct, 'incorrect': incorrect, 'accuracy': acc}
-                except Exception:
-                    extra = {'correct': 0, 'incorrect': 0, 'accuracy': 0}
-        else:
-            # Get progress from database
-            prog_dict = db.get_progress(user, meta['id'])
-            correct = sum(int(v.get('correct_streak', 0)) for v in prog_dict.values())
-            incorrect = sum(int(v.get('incorrect_count', 0)) for v in prog_dict.values())
-            denom = correct + incorrect
-            acc = int((correct * 100) / denom) if denom else 0
-            extra = {'correct': correct, 'incorrect': incorrect, 'accuracy': acc}
+        prog = load_pool_progress(user, meta.get('id'))
+        prog_dict = {k: (v.__dict__ if isinstance(v, CardState) else v) for k, v in prog.items()}
+        correct = sum(int(v.get('correct_streak', 0)) for v in prog_dict.values())
+        incorrect = sum(int(v.get('incorrect_count', 0)) for v in prog_dict.values())
+        denom = correct + incorrect
+        acc = int((correct * 100) / denom) if denom else 0
+        extra = {'correct': correct, 'incorrect': incorrect, 'accuracy': acc}
 
     return render_template('pool_stats.html', meta=meta, stats=stats, times=times, extra=extra, points=gs.get('points',0), rank=gs.get('rank','Unranked'), daily_streak=gs.get('daily_streak', 0), current_user=user)
-
-    return render_template('pool_stats.html', meta=meta, stats=stats, times=times, extra=extra, points=gs.get('points',0), rank=gs.get('rank','Unranked'), daily_streak=gs.get('daily_streak', 0), current_user=current_user())
 
 @app.route('/question', methods=['GET', 'POST'])
 def question():
@@ -761,14 +738,9 @@ def end():
         if state:
             prog = {k: CardState(**v) for k, v in state.get('progress', {}).items()}
             # save global progress file (for legacy/global usage)
-            save_progress(PROGRESS_FILE, prog)
-            # Save per-pool progress to database if user is logged in
-            pool_id = session.get('pool_id')
+            pool_id = session.get('pool_id') or 'builtin'
             username = current_user()
-            if pool_id and username and pool_id != 'builtin':
-                # Save progress to database
-                progress_dict = {k: v.__dict__ for k, v in prog.items()}
-                db.save_bulk_progress(username, pool_id, progress_dict)
+            save_pool_progress(username, pool_id, prog)
             
             log_event(LOG_FILE, {"mode": "web", "count_pool": len(state.get('pool', []))})
             # Delete session from database
