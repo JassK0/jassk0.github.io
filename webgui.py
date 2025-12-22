@@ -729,7 +729,7 @@ def question():
         db.update_session(sid, state)
 
         # gamification: award points (per-user or guest) after answering
-        user = current_user()
+        user = current_user() or state.get('username')  # fallback to session owner to avoid losing points when cookie drops
         if user:
             gs = load_gamestate(user)
         else:
@@ -768,8 +768,8 @@ def question():
     # GET: build letter-option pairs for template
     letters = ['A', 'B', 'C', 'D']
     pairs = list(zip(letters, getattr(q, 'options', [])))
-    # load points for signed-in user if available
-    user = current_user()
+    # load points for signed-in user if available (fallback to session owner)
+    user = current_user() or state.get('username')
     pts = load_gamestate(user).get('points', 0) if user else 0
     return render_template('question.html', q=q, pairs=pairs, pool_name=session.get('pool_id'), points=pts, current_user=user)
 

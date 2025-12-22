@@ -75,5 +75,19 @@
     "incorrect_count": 0,
     "last_seen": "2025-10-18T19:11:06",
     "due": "2025-10-19T19:11:06"
+  },
+  "5-07": {
+    "box": 2,
+    "correct_streak": 1,
+    "incorrect_count": 0,
+    "last_seen": "2025-12-22T06:33:41",
+    "due": "2025-12-23T06:33:41"
+  },
+  "11-01": {
+    "box": 2,
+    "correct_streak": 1,
+    "incorrect_count": 0,
+    "last_seen": "2025-12-22T06:34:00",
+    "due": "2025-12-23T06:34:00"
   }
 }
