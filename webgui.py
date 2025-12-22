@@ -5,83 +5,41 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from main import load_questions, load_progress, save_progress, choose_exam_set, filter_questions, parse_chapter_filter, CardState, BUILTIN, log_event
 from datetime import datetime, date, timedelta
 from typing import Tuple
+import db
 
 app = Flask(__name__)
 # For production, read secret key from environment. Fallback to random for dev.
 app.secret_key = os.environ.get('SECRET_KEY') or os.urandom(24)
 
-# In-memory server-side storage for session state to avoid large cookies
-app_state = {}
-
 PROGRESS_FILE = "course_progress.json"
 LOG_FILE = "session_log.jsonl"
-POOLS_META = "data/pools.json"
 DATA_DIR = "data"
-USERS_FILE = os.path.join(DATA_DIR, 'users.json')
+
+# Initialize database on startup
+db.init_db()
 
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
-    if not os.path.exists(POOLS_META):
-        with open(POOLS_META, 'w', encoding='utf-8') as f:
-            json = __import__('json')
-            f.write(json.dumps([]))
 
 def read_pools():
-    ensure_data_dir()
-    import json as _json
-    try:
-        pools = []
-        # global pools
-        if os.path.exists(POOLS_META):
-            try:
-                with open(POOLS_META, 'r', encoding='utf-8') as f:
-                    pools = _json.load(f) or []
-            except Exception:
-                pools = []
-        # user-specific pools override/append
-        username = session.get('username')
-        if username:
-            upath = os.path.join(DATA_DIR, f"pools_{username}.json")
-            if os.path.exists(upath):
-                try:
-                    userp = _json.load(open(upath, 'r', encoding='utf-8')) or []
-                    # merge: user pools after global
-                    pools = pools + userp
-                except Exception:
-                    pass
-        return pools
-    except Exception:
-        return []
+    """Get pools from database for current user."""
+    username = session.get('username')
+    pools_data = db.get_pools(username)
+    # Convert to old format for compatibility
+    return [{'id': p['id'], 'path': p['file_path'], 'orig_name': p['orig_name']} for p in pools_data]
 
 
 def read_users():
-    ensure_data_dir()
-    import json as _json
-    try:
-        with open(USERS_FILE, 'r', encoding='utf-8') as f:
-            return _json.load(f)
-    except Exception:
-        return {}
-
+    """Get all users from database."""
+    return db.get_all_users()
 
 def write_users(users):
-    ensure_data_dir()
-    import json as _json
-    with open(USERS_FILE, 'w', encoding='utf-8') as f:
-        _json.dump(users, f, indent=2)
+    """Deprecated - users are now managed through database."""
+    pass
 
 def write_pools(pools):
-    ensure_data_dir()
-    import json as _json
-    # If user signed in, write to their pools file; otherwise write global pools
-    username = session.get('username')
-    if username:
-        upath = os.path.join(DATA_DIR, f"pools_{username}.json")
-        with open(upath, 'w', encoding='utf-8') as f:
-            _json.dump(pools, f, indent=2)
-    else:
-        with open(POOLS_META, 'w', encoding='utf-8') as f:
-            _json.dump(pools, f, indent=2)
+    """Deprecated - pools are now managed through database."""
+    pass
 
 def compute_stats_for_pool(pool_meta):
     # pool_meta: {id,path,orig_name}
@@ -92,13 +50,12 @@ def compute_stats_for_pool(pool_meta):
         qpath = pool_meta['path']
         qs = load_questions(qpath)
     qmap = {q.id: q for q in qs}
-    prog_fp = f"{DATA_DIR}/progress_{pool_meta['id']}.json"
-    prog = {}
-    if os.path.exists(prog_fp):
-        try:
-            prog = __import__('json').load(open(prog_fp, 'r', encoding='utf-8'))
-        except Exception:
-            prog = {}
+    # Get progress from database
+    username = session.get('username')
+    if username:
+        prog = db.get_progress(username, pool_meta['id'])
+    else:
+        prog = {}
     # compute stats
     total = len(qs)
     answered = len(prog)
@@ -144,24 +101,43 @@ def compute_stats_for_pool(pool_meta):
 
 def compute_progress_timeseries(pool_meta):
     # Build a simple cumulative timeseries of questions with a last_seen date
-    prog_fp = PROGRESS_FILE if pool_meta.get('id') == 'builtin' else f"{DATA_DIR}/progress_{pool_meta['id']}.json"
+    username = session.get('username')
+    if not username:
+        return {'labels': [], 'values': []}
+    
     times = {}
-    if os.path.exists(prog_fp):
-        try:
-            import json as _json
-            raw = _json.load(open(prog_fp, 'r', encoding='utf-8'))
-            for qid, v in raw.items():
-                last = v.get('last_seen')
-                if not last:
-                    continue
-                try:
-                    d = last.split('T', 1)[0]
-                except Exception:
-                    d = last
-                times.setdefault(d, 0)
-                times[d] += 1
-        except Exception:
-            times = {}
+    # Get progress from database
+    if pool_meta.get('id') == 'builtin':
+        # For builtin, use file-based progress for now
+        if os.path.exists(PROGRESS_FILE):
+            try:
+                import json as _json
+                raw = _json.load(open(PROGRESS_FILE, 'r', encoding='utf-8'))
+                for qid, v in raw.items():
+                    last = v.get('last_seen')
+                    if not last:
+                        continue
+                    try:
+                        d = last.split('T', 1)[0]
+                    except Exception:
+                        d = last
+                    times.setdefault(d, 0)
+                    times[d] += 1
+            except Exception:
+                times = {}
+    else:
+        prog_dict = db.get_progress(username, pool_meta['id'])
+        for qid, v in prog_dict.items():
+            last = v.get('last_seen')
+            if not last:
+                continue
+            try:
+                d = last.split('T', 1)[0]
+            except Exception:
+                d = last
+            times.setdefault(d, 0)
+            times[d] += 1
+    
     # create sorted cumulative lists
     if not times:
         return {'labels': [], 'values': []}
@@ -176,59 +152,27 @@ def compute_progress_timeseries(pool_meta):
     return {'labels': labels, 'values': cum}
 
 
-def _gamestate_path(user_id=None):
-    ensure_data_dir()
-    if user_id:
-        return os.path.join(DATA_DIR, f"gamestate_{user_id}.json")
-    return os.path.join(DATA_DIR, "gamestate.json")
-
-
 def load_gamestate(user_id=None):
-    import json as _json
-    fp = _gamestate_path(user_id)
-    if os.path.exists(fp):
-        try:
-            gs = _json.load(open(fp, 'r', encoding='utf-8'))
-            # ensure numeric points and up-to-date rank
-            try:
-                # coerce points to int when possible
-                if 'points' in gs:
-                    gs['points'] = int(gs.get('points', 0))
-            except Exception:
-                gs['points'] = 0
-            # recalc rank from points to keep consistency
-            check_and_award_badges(gs)
-            # persist any change
-            try:
-                _json.dump(gs, open(fp, 'w', encoding='utf-8'), indent=2)
-            except Exception:
-                pass
-            return gs
-        except Exception:
-            pass
-    # default gamestate
-    gs = {
+    """Load gamestate from database. user_id should be username."""
+    if user_id:
+        gs = db.get_gamestate(user_id)
+        check_and_award_badges(gs)
+        return gs
+    # default gamestate for non-logged-in users
+    return {
         'points': 0,
         'rank': 'Unranked',
-        'answer_streak': 0,  # positive = correct streak length, negative = wrong streak length
+        'answer_streak': 0,
         'daily_streak': 0,
         'last_active': None,
         'history': []
     }
-    try:
-        _json.dump(gs, open(fp, 'w', encoding='utf-8'), indent=2)
-    except Exception:
-        pass
-    return gs
 
 
 def save_gamestate(gs, user_id=None):
-    import json as _json
-    fp = _gamestate_path(user_id)
-    try:
-        _json.dump(gs, open(fp, 'w', encoding='utf-8'), indent=2)
-    except Exception:
-        pass
+    """Save gamestate to database. user_id should be username."""
+    if user_id:
+        db.update_gamestate(user_id, gs)
 
 
 def update_daily_streak(gs):
@@ -289,14 +233,6 @@ def check_and_award_badges(gs):
     return r
 
 
-def get_user_id():
-    # ensure a per-session user id for session-scoped gamestate
-    uid = session.get('user_id')
-    if not uid:
-        uid = uuid.uuid4().hex
-        session['user_id'] = uid
-    return uid
-
 
 def current_user():
     # return username if signed in
@@ -304,21 +240,9 @@ def current_user():
 
 
 def all_user_points():
-    """Return a dict username -> points by reading users.json and per-user gamestate files."""
-    users = read_users()
-    res = {}
-    import json as _json
-    for u in users.keys():
-        try:
-            gp = _gamestate_path(u)
-            if os.path.exists(gp):
-                data = _json.load(open(gp, 'r', encoding='utf-8'))
-                res[u] = (int(data.get('points', 0)), data.get('rank','Unranked'))
-            else:
-                res[u] = (0, 'Unranked')
-        except Exception:
-            res[u] = 0
-    return res
+    """Return a dict username -> (points, rank) from database."""
+    leaderboard = db.get_leaderboard()
+    return {row['username']: (row['points'], row['rank']) for row in leaderboard}
 
 
 @app.route('/leaderboard')
@@ -421,12 +345,12 @@ def index():
         s = compute_stats_for_pool(p)
         t = compute_progress_timeseries(p)
         stats.append({'meta': p, 'stats': s, 'times': t})
-    uid = get_user_id()
     user = current_user()
-    gs = load_gamestate(user or uid)
-    # update daily streak on each visit
-    gs = update_daily_streak(gs)
-    save_gamestate(gs, user or uid)
+    gs = load_gamestate(user) if user else {'points': 0, 'rank': 'Unranked', 'daily_streak': 0}
+    # update daily streak on each visit for logged-in users
+    if user:
+        gs = update_daily_streak(gs)
+        save_gamestate(gs, user)
     # prepare leaderboard summary for embedding on the main page
     pts = all_user_points()
     # pts: username -> (points, rank)
@@ -451,7 +375,8 @@ def start():
     src = None
     if f:
         # only allow uploads from signed-in users
-        if not current_user():
+        username = current_user()
+        if not username:
             flash('Please sign in to upload pools', 'error')
             return redirect(url_for('login'))
         pid = uuid.uuid4().hex
@@ -460,10 +385,8 @@ def start():
         ensure_data_dir()
         f.save(dest)
         pname = request.form.get('pool_name') or f.filename
-        pools = read_pools()
-        meta = {'id': pid, 'path': dest, 'orig_name': pname}
-        pools.append(meta)
-        write_pools(pools)
+        # Save to database
+        db.create_pool(pid, username, pname, dest)
         src = dest
     else:
         src = request.form.get('source') or None
@@ -478,14 +401,12 @@ def start():
     if not pool:
         return "No questions in pool. Go <a href='/'>back</a>."
     sid = uuid.uuid4().hex
-    app_state[sid] = {
-        'pool': [q.__dict__ for q in pool],
-        'num': num,
-        'index': 0,
-        'set': [q.__dict__ for q in choose_exam_set(pool, num, load_progress(PROGRESS_FILE))],
-        'wrong': [],
-        'progress': {k: v.__dict__ for k,v in load_progress(PROGRESS_FILE).items()},
-    }
+    username = current_user()
+    # Store session in database
+    pool_data = [q.__dict__ for q in pool]
+    exam_set = [q.__dict__ for q in choose_exam_set(pool, num, load_progress(PROGRESS_FILE))]
+    progress_data = {k: v.__dict__ for k,v in load_progress(PROGRESS_FILE).items()}
+    db.create_session(sid, username, 'builtin', pool_data, exam_set, num, progress_data)
     session['sid'] = sid
     return redirect(url_for('question'))
 
@@ -493,9 +414,11 @@ def start():
 def pool_preview():
     sid = session.get('sid')
     # If there is an active session, use its pool. Otherwise allow preview via query params
-    if sid and sid in app_state:
-        pool = app_state[sid]['pool']
-        return render_template('pool.html', qs=pool, count=len(pool))
+    if sid:
+        state = db.get_session(sid)
+        if state:
+            pool = state['pool']
+            return render_template('pool.html', qs=pool, count=len(pool))
 
     # No session: build pool from optional GET args (or default built-in pool)
     src = request.args.get('source') or None
@@ -517,7 +440,8 @@ def pools():
     pools_display = [builtin_meta] + pools
     if request.method == 'POST':
         # handle file upload - only signed-in users may upload
-        if not current_user():
+        username = current_user()
+        if not username:
             flash('Please sign in to upload pools', 'error')
             return redirect(url_for('login'))
         f = request.files.get('file')
@@ -528,9 +452,8 @@ def pools():
         dest = os.path.join(DATA_DIR, filename)
         f.save(dest)
         pname = request.form.get('pool_name') or f.filename
-        meta = {'id': pid, 'path': dest, 'orig_name': pname}
-        pools.append(meta)
-        write_pools(pools)
+        # Save to database
+        db.create_pool(pid, username, pname, dest)
         return redirect(url_for('pools'))
     # GET
     stats = []
@@ -542,45 +465,23 @@ def pools():
 
 @app.route('/pools/<pid>/delete', methods=['POST'])
 def pools_delete(pid):
-    # remove pool metadata, delete uploaded file and per-pool progress
-    pools = read_pools()
-    meta = next((p for p in pools if p['id']==pid), None)
-    if not meta:
-        return redirect(url_for('pools'))
-    # delete file if it exists and looks like an uploaded file
-    try:
-        fp = meta.get('path')
-        if fp and os.path.exists(fp):
-            os.remove(fp)
-    except Exception:
-        pass
-    # delete per-pool progress file
-    try:
-        prog_fp = f"{DATA_DIR}/progress_{pid}.json"
-        if os.path.exists(prog_fp):
-            os.remove(prog_fp)
-    except Exception:
-        pass
-    # remove from pools list
-    pools = [p for p in pools if p['id'] != pid]
-    write_pools(pools)
+    # remove pool from database (will cascade delete progress and file)
+    db.delete_pool(pid)
     return redirect(url_for('pools'))
 
 
 @app.route('/pools/<pid>/rename', methods=['GET', 'POST'])
 def pools_rename(pid):
-    pools = read_pools()
     if pid == 'builtin':
         # cannot rename builtin
         return redirect(url_for('pools'))
-    meta = next((p for p in pools if p['id']==pid), None)
+    meta = db.get_pool(pid)
     if not meta:
         return redirect(url_for('pools'))
     if request.method == 'POST':
         newname = request.form.get('name')
         if newname:
-            meta['orig_name'] = newname
-            write_pools(pools)
+            db.update_pool_name(pid, newname)
         return redirect(url_for('pools'))
     return f"<form method='post'>New name: <input name='name' value='{meta.get('orig_name','')}'><button>Save</button></form>"
 
@@ -601,27 +502,15 @@ def signup():
         if not strong:
             flash('Password too weak; please include: ' + ', '.join(reasons), 'error')
             return redirect(url_for('signup'))
-        # store user with secure hash
-        users[username] = {'pw': generate_password_hash(password)}
-        write_users(users)
-        # migrate guest gamestate if exists
-        guest_id = session.get('user_id')
-        if guest_id:
-            try:
-                gp = _gamestate_path(guest_id)
-                up = _gamestate_path(username)
-                if os.path.exists(gp) and not os.path.exists(up):
-                    open(up, 'wb').write(open(gp, 'rb').read())
-            except Exception:
-                pass
+        # Create user in database
+        db.create_user(username, generate_password_hash(password))
         session['username'] = username
         flash('Account created and signed in', 'success')
         return redirect(url_for('index'))
 
     # GET: provide header context
-    uid = get_user_id()
     user = current_user()
-    gs = load_gamestate(user or uid)
+    gs = load_gamestate(user) if user else {'points': 0, 'rank': 'Unranked', 'daily_streak': 0}
     return render_template('signup.html', current_user=user, points=gs.get('points',0), rank=gs.get('rank','Unranked'), daily_streak=gs.get('daily_streak', 0))
 
 
@@ -631,26 +520,15 @@ def login():
         username = (request.form.get('username') or '').strip()
         password = request.form.get('password') or ''
         users = read_users()
-        if username not in users or not check_password_hash(users.get(username, {}).get('pw',''), password):
+        if username not in users or not check_password_hash(users.get(username, ''), password):
             flash('Invalid credentials', 'error')
             return redirect(url_for('login'))
         # user authenticated
-        # migrate guest gamestate if present
-        guest_id = session.get('user_id')
-        if guest_id:
-            try:
-                gp = _gamestate_path(guest_id)
-                up = _gamestate_path(username)
-                if os.path.exists(gp) and not os.path.exists(up):
-                    open(up, 'wb').write(open(gp, 'rb').read())
-            except Exception:
-                pass
         session['username'] = username
         flash('Signed in', 'success')
         return redirect(url_for('index'))
-    uid = get_user_id()
     user = current_user()
-    gs = load_gamestate(user or uid)
+    gs = load_gamestate(user) if user else {'points': 0, 'rank': 'Unranked', 'daily_streak': 0}
     return render_template('login.html', current_user=user, points=gs.get('points',0), rank=gs.get('rank','Unranked'), daily_streak=gs.get('daily_streak', 0))
 
 
@@ -676,29 +554,24 @@ def pools_special(pid):
         # nothing to review
         return redirect(url_for('pools'))
     # load questions and per-pool progress
+    username = current_user()
     if meta.get('id') == 'builtin':
         qs = load_questions(None)
         prog = load_progress(PROGRESS_FILE)
     else:
         qs = load_questions(meta['path'])
-        prog = {}
-        prog_fp = f"{DATA_DIR}/progress_{meta['id']}.json"
-        if os.path.exists(prog_fp):
-            try:
-                import json as _json
-                raw = _json.load(open(prog_fp, 'r', encoding='utf-8'))
-                prog = {k: CardState(**v) for k,v in raw.items()}
-            except Exception:
-                prog = {}
+        # Get progress from database
+        if username:
+            prog_dict = db.get_progress(username, meta['id'])
+            prog = {k: CardState(**v) for k, v in prog_dict.items()}
+        else:
+            prog = {}
     sid = uuid.uuid4().hex
-    app_state[sid] = {
-        'pool': [q.__dict__ for q in qs],
-        'num': 10,
-        'index': 0,
-        'set': [q.__dict__ for q in choose_special_set(qs, 10, prog)],
-        'wrong': [],
-        'progress': {k: v.__dict__ for k, v in prog.items()},
-    }
+    # Store session in database
+    pool_data = [q.__dict__ for q in qs]
+    exam_set = [q.__dict__ for q in choose_special_set(qs, 10, prog)]
+    progress_data = {k: v.__dict__ for k, v in prog.items()}
+    db.create_session(sid, username, pid, pool_data, exam_set, 10, progress_data)
     session['sid'] = sid
     session['pool_id'] = pid
     return redirect(url_for('question'))
@@ -715,41 +588,34 @@ def pools_start(pid):
         return redirect(url_for('pools'))
     if request.method == 'POST':
         num = int(request.form.get('num') or 10)
+        username = current_user()
         # load questions for builtin vs uploaded
         if meta.get('id') == 'builtin':
             pool = BUILTIN[:]
         else:
             all_qs = load_questions(meta['path'])
             pool = all_qs
-        # load per-pool progress if available (so choose_exam_set uses it)
+        # load per-pool progress from database
         prog = {}
         if meta.get('id') == 'builtin':
             # fall back to global progress file for builtin
             prog = load_progress(PROGRESS_FILE)
         else:
-            prog_fp = f"{DATA_DIR}/progress_{meta['id']}.json"
-            if os.path.exists(prog_fp):
-                try:
-                    import json as _json
-                    raw = _json.load(open(prog_fp, 'r', encoding='utf-8'))
-                    prog = {k: CardState(**v) for k, v in raw.items()}
-                except Exception:
-                    prog = {}
+            if username:
+                prog_dict = db.get_progress(username, meta['id'])
+                prog = {k: CardState(**v) for k, v in prog_dict.items()}
 
         sid = uuid.uuid4().hex
-        app_state[sid] = {
-            'pool': [q.__dict__ for q in pool],
-            'num': num,
-            'index': 0,
-            'set': [q.__dict__ for q in choose_exam_set(pool, num, prog)],
-            'wrong': [],
-            'progress': {k: v.__dict__ for k, v in prog.items()},
-        }
+        # Store session in database
+        pool_data = [q.__dict__ for q in pool]
+        exam_set = [q.__dict__ for q in choose_exam_set(pool, num, prog)]
+        progress_data = {k: v.__dict__ for k, v in prog.items()}
+        db.create_session(sid, username, pid, pool_data, exam_set, num, progress_data)
         session['sid'] = sid
-        # remember current pool id for saving progress to per-pool file
         session['pool_id'] = pid
         return redirect(url_for('question'))
     return render_template('pools_start.html', meta=meta, current_user=current_user())
+
 
 
 @app.route('/pools/<pid>/stats')
@@ -764,34 +630,51 @@ def pools_stats(pid):
             return redirect(url_for('pools'))
     stats = compute_stats_for_pool(meta)
     times = compute_progress_timeseries(meta)
-    uid = get_user_id()
-    gs = load_gamestate(uid)
-    # update daily streak when viewing stats
-    gs = update_daily_streak(gs)
-    save_gamestate(gs, uid)
-    # build extra summary: correct / incorrect counts and accuracy% from per-pool progress
+    user = current_user()
+    gs = load_gamestate(user) if user else {'points': 0, 'rank': 'Unranked', 'daily_streak': 0}
+    # update daily streak when viewing stats for logged-in users
+    if user:
+        gs = update_daily_streak(gs)
+        save_gamestate(gs, user)
+    # build extra summary: correct / incorrect counts and accuracy% from database
     extra = {'correct': 0, 'incorrect': 0, 'accuracy': 0}
-    prog_fp = PROGRESS_FILE if meta.get('id') == 'builtin' else f"{DATA_DIR}/progress_{meta['id']}.json"
-    if os.path.exists(prog_fp):
-        try:
-            import json as _json
-            raw = _json.load(open(prog_fp, 'r', encoding='utf-8'))
-            correct = sum(int(v.get('correct_streak', 0)) for v in raw.values())
-            incorrect = sum(int(v.get('incorrect_count', 0)) for v in raw.values())
+    if user:
+        if meta.get('id') == 'builtin':
+            # For builtin, use file-based progress
+            if os.path.exists(PROGRESS_FILE):
+                try:
+                    import json as _json
+                    raw = _json.load(open(PROGRESS_FILE, 'r', encoding='utf-8'))
+                    correct = sum(int(v.get('correct_streak', 0)) for v in raw.values())
+                    incorrect = sum(int(v.get('incorrect_count', 0)) for v in raw.values())
+                    denom = correct + incorrect
+                    acc = int((correct * 100) / denom) if denom else 0
+                    extra = {'correct': correct, 'incorrect': incorrect, 'accuracy': acc}
+                except Exception:
+                    extra = {'correct': 0, 'incorrect': 0, 'accuracy': 0}
+        else:
+            # Get progress from database
+            prog_dict = db.get_progress(user, meta['id'])
+            correct = sum(int(v.get('correct_streak', 0)) for v in prog_dict.values())
+            incorrect = sum(int(v.get('incorrect_count', 0)) for v in prog_dict.values())
             denom = correct + incorrect
             acc = int((correct * 100) / denom) if denom else 0
             extra = {'correct': correct, 'incorrect': incorrect, 'accuracy': acc}
-        except Exception:
-            extra = {'correct': 0, 'incorrect': 0, 'accuracy': 0}
+
+    return render_template('pool_stats.html', meta=meta, stats=stats, times=times, extra=extra, points=gs.get('points',0), rank=gs.get('rank','Unranked'), daily_streak=gs.get('daily_streak', 0), current_user=user)
 
     return render_template('pool_stats.html', meta=meta, stats=stats, times=times, extra=extra, points=gs.get('points',0), rank=gs.get('rank','Unranked'), daily_streak=gs.get('daily_streak', 0), current_user=current_user())
 
 @app.route('/question', methods=['GET', 'POST'])
 def question():
     sid = session.get('sid')
-    if not sid or sid not in app_state:
+    if not sid:
         return redirect(url_for('index'))
-    state = app_state[sid]
+    # Get session from database
+    state = db.get_session(sid)
+    if not state:
+        return redirect(url_for('index'))
+    
     s = state['set']
     idx = state.get('index', 0)
     if idx >= len(s):
@@ -800,6 +683,7 @@ def question():
             state['set'] = state['wrong']
             state['wrong'] = []
             state['index'] = 0
+            db.update_session(sid, state)
             return redirect(url_for('question'))
         return "Session complete. <a href='/end'>End and Save</a>"
 
@@ -828,84 +712,74 @@ def question():
             prog[q.id] = st
         state['progress'] = {k: v.__dict__ for k, v in prog.items()}
         state['index'] = idx + 1
+        # Update session in database
+        db.update_session(sid, state)
 
         # gamification: award points (per-user) after answering
         user = current_user()
-        uid = user or get_user_id()
-        gs = load_gamestate(uid)
-        # ensure daily streak is current for this activity
-        gs = update_daily_streak(gs)
+        if user:
+            gs = load_gamestate(user)
+            # ensure daily streak is current for this activity
+            gs = update_daily_streak(gs)
 
-        # implement streak-based doubling
-        streak = gs.get('answer_streak', 0) or 0
-        if ok:
-            if streak < 0:
-                streak = 0
-            delta = 10 * (2 ** streak)
-            streak = streak + 1
-            reason = 'correct'
+            # implement streak-based doubling
+            streak = gs.get('answer_streak', 0) or 0
+            if ok:
+                if streak < 0:
+                    streak = 0
+                delta = 10 * (2 ** streak)
+                streak = streak + 1
+                reason = 'correct'
+            else:
+                if streak > 0:
+                    streak = 0
+                # wrong penalty doubles on consecutive wrongs
+                delta = - (2 * (2 ** abs(streak))) if streak < 0 else -2
+                streak = streak - 1
+                reason = 'incorrect'
+            gs['answer_streak'] = streak
+            award_points(gs, delta, reason, user_id=user)
+            return render_template('result.html', ok=ok, q=q, points_delta=delta, points=gs.get('points', 0), rank=gs.get('rank', 'Unranked'), daily_streak=gs.get('daily_streak', 0), current_user=current_user())
         else:
-            if streak > 0:
-                streak = 0
-            # wrong penalty doubles on consecutive wrongs
-            delta = - (2 * (2 ** abs(streak))) if streak < 0 else -2
-            streak = streak - 1
-            reason = 'incorrect'
-        gs['answer_streak'] = streak
-        award_points(gs, delta, reason, user_id=uid)
-
-        # Render the result page for POST
-        return render_template('result.html', ok=ok, q=q, points_delta=delta, points=gs.get('points', 0), rank=gs.get('rank', 'Unranked'), daily_streak=gs.get('daily_streak', 0), current_user=current_user())
+            # Non-logged in user
+            return render_template('result.html', ok=ok, q=q, points_delta=0, points=0, rank='Unranked', daily_streak=0, current_user=None)
 
     # GET: build letter-option pairs for template
     letters = ['A', 'B', 'C', 'D']
     pairs = list(zip(letters, getattr(q, 'options', [])))
     # load points for signed-in user if available
     user = current_user()
-    pts = load_gamestate(user or get_user_id()).get('points', 0)
+    pts = load_gamestate(user).get('points', 0) if user else 0
     return render_template('question.html', q=q, pairs=pairs, pool_name=session.get('pool_id'), points=pts, current_user=user)
 
 @app.route('/end')
 def end():
     # persist progress
     sid = session.get('sid')
-    if sid and sid in app_state:
-        state = app_state.pop(sid)
-        prog = {k: CardState(**v) for k, v in state.get('progress', {}).items()}
-        # save global progress file (for legacy/global usage)
-        save_progress(PROGRESS_FILE, prog)
-        # also save per-pool progress if this session came from a specific pool
-        pool_id = session.get('pool_id')
-        if pool_id:
-            ensure_data_dir()
-            prog_fp = f"{DATA_DIR}/progress_{pool_id}.json"
-            try:
-                import json as _json
-                existing = {}
-                if os.path.exists(prog_fp):
-                    try:
-                        existing = _json.load(open(prog_fp, 'r', encoding='utf-8'))
-                    except Exception:
-                        existing = {}
-                # merge/overwrite with latest progress
-                new_prog = {k: v.__dict__ for k, v in prog.items()}
-                existing.update(new_prog)
-                with open(prog_fp, 'w', encoding='utf-8') as f:
-                    _json.dump(existing, f, indent=2)
-            except Exception:
-                pass
-
-        log_event(LOG_FILE, {"mode": "web", "count_pool": len(state.get('pool', []))})
-        # update last_active for gamestate on session end
-        try:
-            uid = session.get('user_id')
-            if uid:
-                gs = load_gamestate(uid)
+    if sid:
+        state = db.get_session(sid)
+        if state:
+            prog = {k: CardState(**v) for k, v in state.get('progress', {}).items()}
+            # save global progress file (for legacy/global usage)
+            save_progress(PROGRESS_FILE, prog)
+            # Save per-pool progress to database if user is logged in
+            pool_id = session.get('pool_id')
+            username = current_user()
+            if pool_id and username and pool_id != 'builtin':
+                # Save progress to database
+                progress_dict = {k: v.__dict__ for k, v in prog.items()}
+                db.save_bulk_progress(username, pool_id, progress_dict)
+            
+            log_event(LOG_FILE, {"mode": "web", "count_pool": len(state.get('pool', []))})
+            # Delete session from database
+            db.delete_session(sid)
+            
+            # update last_active for gamestate on session end
+            if username:
+                gs = load_gamestate(username)
                 gs['last_active'] = datetime.utcnow().isoformat(timespec='seconds')
-                save_gamestate(gs, uid)
-        except Exception:
-            pass
-        # clear session pool id
+                save_gamestate(gs, username)
+        # clear session vars
         session.pop('pool_id', None)
         session.pop('sid', None)
     return "Saved progress. <a href='/'>Back to home</a>"

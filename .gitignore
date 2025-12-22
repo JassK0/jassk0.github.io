@@ -1,1 +1,65 @@
+# Virtual environments
 /.venv
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# SQLite database (contains user data)
+data/blg_exam.db
+data/blg_exam.db-journal
+data/*.db
+data/*.db-journal
+
+# Old JSON data files (deprecated)
+data/users.json
+data/pools.json
+data/pools_*.json
+data/gamestate*.json
+data/progress_*.json
+
+# Session and progress logs
+session_log.jsonl
+blg143_session_log.jsonl
+course_progress.json
+blg143_progress.json
+
+# CSV uploads (user data)
+data/*.csv
+data/*_*.csv
+
+# Backup files
+data/backup/
+data/backups/
+*.backup
+*.bak
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+*.log
+
+# Test outputs
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
